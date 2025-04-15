@@ -569,6 +569,38 @@ class FileSystem:
             return content
         return None
     
+    def write_file(self, filename, content):
+        """Write content to a file. Creates the file if it doesn't exist."""
+        full_path = f"{self.current_dir}{filename}"
+        size = len(content.encode('utf-8')) // 1024 + 1  # Convert to KB
+        
+        if full_path in self.files:
+            # Update existing file
+            old_content, old_size, path = self.files[full_path]
+            if self.storage.deallocate(full_path) and self.storage.allocate(full_path, size):
+                self.files[full_path] = (content, size, path)
+                logger.info(f"Updated file {full_path} with size {size}KB")
+                return True
+        else:
+            # Create new file
+            if self.storage.allocate(full_path, size):
+                self.files[full_path] = (content, size, self.current_dir)
+                self.directories[self.current_dir].append((filename, "file"))
+                logger.info(f"Created file {full_path} with size {size}KB")
+                return True
+        
+        logger.warning(f"Failed to write to file {full_path}")
+        return False
+
+    def append_file(self, filename, content):
+        """Append content to an existing file."""
+        full_path = f"{self.current_dir}{filename}"
+        if full_path in self.files:
+            old_content, old_size, path = self.files[full_path]
+            new_content = old_content + content
+            return self.write_file(filename, new_content)
+        return False
+    
     def create_directory(self, dirname):
         """Create a new directory in the current directory."""
         if not dirname or "/" in dirname:
@@ -968,6 +1000,156 @@ class Dropdown:
         
         return False
 
+class TextEditor:
+    def __init__(self, font):
+        self.font = font
+        self.content = ""
+        self.filename = ""
+        self.cursor_pos = 0
+        self.scroll_pos = 0
+        self.running = False
+        self.screen = None
+        self.clock = None
+        self.save_button = None
+        self.close_button = None
+
+    def initialize(self):
+        """Initialize the editor window and components."""
+        pygame.init()
+        self.screen = pygame.display.set_mode((800, 600))
+        pygame.display.set_caption("Text Editor")
+        self.clock = pygame.time.Clock()
+        
+        # Create buttons with proper actions
+        button_font = pygame.font.SysFont(None, 24)
+        self.save_button = Button(650, 550, 100, 30, "Save", Config.GREEN, self.save_file)
+        self.close_button = Button(550, 550, 100, 30, "Close", Config.RED, self.close)
+
+    def open(self, filename, content):
+        """Open a file in the editor."""
+        self.filename = filename
+        self.content = content
+        self.cursor_pos = len(content)
+        self.scroll_pos = 0
+
+    def save_file(self):
+        """Save the current file content."""
+        if hasattr(self, 'filesystem') and self.filename:
+            if self.filesystem.write_file(self.filename, self.content):
+                self.status_message = f"Saved changes to {self.filename}"
+            else:
+                self.status_message = f"Failed to save {self.filename}"
+
+    def handle_events(self, filesystem):
+        """Handle editor events."""
+        self.filesystem = filesystem  # Store filesystem reference for save operation
+        
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.close()
+                return
+            
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                mouse_pos = pygame.mouse.get_pos()
+                if self.save_button.handle_event(event):
+                    self.save_file()
+                elif self.close_button.handle_event(event):
+                    self.close()
+                    return
+            
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN:
+                    self.content = self.content[:self.cursor_pos] + '\n' + self.content[self.cursor_pos:]
+                    self.cursor_pos += 1
+                elif event.key == pygame.K_BACKSPACE:
+                    if self.cursor_pos > 0:
+                        self.content = self.content[:self.cursor_pos-1] + self.content[self.cursor_pos:]
+                        self.cursor_pos -= 1
+                elif event.key == pygame.K_DELETE:
+                    if self.cursor_pos < len(self.content):
+                        self.content = self.content[:self.cursor_pos] + self.content[self.cursor_pos+1:]
+                elif event.key == pygame.K_LEFT:
+                    if self.cursor_pos > 0:
+                        self.cursor_pos -= 1
+                elif event.key == pygame.K_RIGHT:
+                    if self.cursor_pos < len(self.content):
+                        self.cursor_pos += 1
+                elif event.key == pygame.K_UP:
+                    lines = self.content[:self.cursor_pos].split('\n')
+                    if len(lines) > 1:
+                        prev_line = lines[-2]
+                        self.cursor_pos -= len(lines[-1]) + 1
+                        self.cursor_pos = max(0, self.cursor_pos - len(prev_line))
+                elif event.key == pygame.K_DOWN:
+                    lines = self.content[self.cursor_pos:].split('\n')
+                    if len(lines) > 1:
+                        next_line = lines[1]
+                        self.cursor_pos += len(lines[0]) + 1
+                        self.cursor_pos = min(len(self.content), self.cursor_pos + len(next_line))
+                elif event.key == pygame.K_HOME:
+                    lines = self.content[:self.cursor_pos].split('\n')
+                    self.cursor_pos -= len(lines[-1])
+                elif event.key == pygame.K_END:
+                    lines = self.content[:self.cursor_pos].split('\n')
+                    self.cursor_pos += len(lines[-1])
+                elif event.key == pygame.K_PAGEUP:
+                    self.scroll_pos = max(0, self.scroll_pos - 10)
+                elif event.key == pygame.K_PAGEDOWN:
+                    lines = self.content.split('\n')
+                    self.scroll_pos = min(len(lines) - 30, self.scroll_pos + 10)
+                elif event.unicode.isprintable():
+                    self.content = self.content[:self.cursor_pos] + event.unicode + self.content[self.cursor_pos:]
+                    self.cursor_pos += 1
+
+    def run(self, filesystem):
+        """Run the editor main loop."""
+        self.running = True
+        while self.running:
+            self.handle_events(filesystem)
+            self.draw()
+            self.clock.tick(60)
+        # Don't call pygame.quit() here as it would close the main application
+
+    def close(self):
+        """Close the editor window."""
+        self.running = False
+        # Don't call pygame.display.quit() as it destroys the display surface
+
+    def draw(self):
+        """Draw the editor interface."""
+        self.screen.fill(Config.WHITE)
+        
+        # Draw title
+        title = self.font.render(f"Editing: {self.filename}", True, Config.BLACK)
+        self.screen.blit(title, (20, 20))
+        
+        # Draw content area
+        pygame.draw.rect(self.screen, Config.LIGHT_BLUE, (20, 60, 760, 480), 2)
+        
+        # Draw text content
+        lines = self.content.split('\n')
+        visible_lines = 30  # Approximate number of visible lines
+        start_line = self.scroll_pos
+        end_line = min(start_line + visible_lines, len(lines))
+        
+        for i, line in enumerate(lines[start_line:end_line]):
+            text = self.font.render(line, True, Config.BLACK)
+            self.screen.blit(text, (30, 80 + i * 20))
+        
+        # Draw cursor
+        cursor_line = len(self.content[:self.cursor_pos].split('\n')) - 1
+        if start_line <= cursor_line < end_line:
+            cursor_x = 30 + self.font.size(self.content[:self.cursor_pos].split('\n')[-1])[0]
+            cursor_y = 80 + (cursor_line - start_line) * 20
+            pygame.draw.line(self.screen, Config.BLACK, (cursor_x, cursor_y), 
+                           (cursor_x, cursor_y + 20), 2)
+        
+        # Draw buttons
+        self.save_button.draw(self.screen, self.font, pygame.mouse.get_pos())
+        self.close_button.draw(self.screen, self.font, pygame.mouse.get_pos())
+        
+        pygame.display.flip()
+
 # OSSim main class (includes drawing on the GUI, functions of various buttons, and event handlers)
 class OSSim:
     def __init__(self):
@@ -1026,7 +1208,20 @@ class OSSim:
         
         self.directory_scroll = 0
         self.selected_directory_item = None
-    
+        
+        # Text editor state
+        self.editor_active = False
+        self.edited_file = None
+        self.editor_content = ""
+        self.editor_cursor = 0
+        self.editor_scroll = 0
+        
+        # Add editor button
+        self.buttons.append(Button(10, 810, 150, 30, "Text Editor", Config.BLUE, self.toggle_editor))
+        
+        # Initialize text editor
+        self.text_editor = TextEditor(self.font)
+
     def _create_buttons(self):
         return [
         Button(10, 770, 150, 30, "Toggle Deadlock", Config.ORANGE, self.toggle_deadlock),
@@ -1044,7 +1239,7 @@ class OSSim:
         Button(10, 730, 150, 30, "Toggle Stor Alg", Config.TEAL, self.toggle_storage_algorithm),
         Button(170, 730, 150, 30, "Save State", Config.ORANGE, self.save_state),
         Button(330, 730, 150, 30, "Load State", Config.ORANGE, self.load_state),
-        Button(490, 730, 150, 30, "Export Log", Config.YELLOW, self.export_log),
+        Button(490, 730, 150, 30, "Text Editor", Config.BLUE, self.toggle_editor),
         Button(650, 730, 150, 30, "Add IO Process", Config.DARK_BLUE, lambda: self.create_process(True)),
         Button(330, 770, 150, 30, "Reset Simulator", Config.RED, self.reset_simulator),
         Button(650, 770, 150, 30, "Create Directory", Config.LIGHT_GREEN, self.create_directory),
@@ -1066,7 +1261,7 @@ class OSSim:
             "Toggle Stor Alg": Tooltip("Switch between storage allocation algorithms", self.font),
             "Save State": Tooltip("Save current simulation state", self.font),
             "Load State": Tooltip("Load saved simulation state", self.font),
-            "Export Log": Tooltip("Export simulation log to file", self.font),
+            "Text Editor": Tooltip("Open text editor for .txt files", self.font),
             "Add IO Process": Tooltip("Create a new IO-bound process", self.font),
             "Reset Simulator": Tooltip("Reset the simulator to initial state", self.font),
             "Create Directory": Tooltip("Create a new directory in the current location", self.font),
@@ -1409,12 +1604,25 @@ class OSSim:
             self.status_message = "Deadlock simulation is not enabled"
             return
 
-        # Detect deadlock and get detailed information
-        deadlock_detected, deadlock_info = self.resource_manager.detect_deadlock()
-    
-        if not deadlock_detected:
-            self.status_message = "No deadlock to resolve"
-            return
+        # Check if there's only one blocked process
+        if len(self.blocked_processes) == 1:
+            single_blocked = self.blocked_processes[0]
+            
+            # Check if the process is waiting for resources that are now available
+            if hasattr(single_blocked, "held_resources"):
+                can_unblock = True
+                for res in single_blocked.held_resources:
+                    if self.resource_manager.resources[res] is not None:
+                        can_unblock = False
+                        break
+                
+                if can_unblock:
+                    # Unblock the process
+                    single_blocked.state = "Ready"
+                    self.scheduler.ready_queue.append(single_blocked)
+                    self.blocked_processes.remove(single_blocked)
+                    self.status_message = f"Process {single_blocked.pid} automatically unblocked - no other processes to hold resources"
+                    return
 
         # Build PID to Process mapping
         pid_map = {}
@@ -1423,6 +1631,13 @@ class OSSim:
         for proc in self.scheduler.ready_queue + self.scheduler.io_queue + self.blocked_processes:
             pid_map[proc.pid] = proc
 
+        # Detect deadlock and get detailed information
+        deadlock_detected, deadlock_info = self.resource_manager.detect_deadlock()
+        
+        if not deadlock_detected:
+            self.status_message = "No deadlock to resolve"
+            return
+
         # Get process instances from detected deadlock info
         deadlocked_processes = [pid_map[info["pid"]] for info in deadlock_info if info["pid"] in pid_map]
 
@@ -1430,31 +1645,29 @@ class OSSim:
             self.status_message = "No deadlock to resolve"
             return
 
-        # Select the process with lowest priority to terminate
-        victim = min(deadlocked_processes, key=lambda p: p.priority)
-
         # Terminate the victim process
+        victim = min(deadlocked_processes, key=lambda p: p.priority)
         victim.state = "Terminated"
         victim.completion_time = self.scheduler.current_time
         self.scheduler.terminated.append(victim)
-
+        
         # Clean up memory
         if victim in self.memory.allocated:
             start, size = self.memory.allocated[victim]
             self.memory.blocks.append((start, size))
             del self.memory.allocated[victim]
             self.memory._merge_adjacent_blocks()
-
+        
         # Release all resources
         self.resource_manager.release(victim.pid)
-
+        
         # Remove victim from queues
         for queue in [self.scheduler.ready_queue, self.scheduler.io_queue, self.blocked_processes]:
             if victim in queue:
                 queue.remove(victim)
         if self.scheduler.current_process == victim:
             self.scheduler.current_process = None
-
+        
         # Remove from resource manager maps
         self.resource_manager.requests.pop(victim.pid, None)
         self.resource_manager.allocated.pop(victim.pid, None)
@@ -1480,7 +1693,7 @@ class OSSim:
         status_parts.append("Deadlock involved:")
         for info in deadlock_info:
             status_parts.append(f"PID {info['pid']}: Holding {info['holding']}, Waiting for {info['waiting_for']}")
-    
+        
         self.status_message = "\n".join(status_parts)
         self.update_performance_metrics()
         self.paused = False
@@ -2107,6 +2320,21 @@ class OSSim:
         # Draw directory structure
         self.draw_directory_structure(self.screen, 10, 430, 380, 170)
         
+        # Draw text editor if active
+        if self.editor_active:
+            save_button, close_button = self.draw_editor(self.screen)
+            
+            # Handle editor button clicks
+            mouse_pos = pygame.mouse.get_pos()
+            if pygame.mouse.get_pressed()[0]:  # Left mouse button
+                if save_button.collidepoint(mouse_pos):
+                    if self.filesystem.write_file(self.edited_file, self.editor_content):
+                        self.status_message = f"Saved changes to {self.edited_file}"
+                    else:
+                        self.status_message = f"Failed to save {self.edited_file}"
+                elif close_button.collidepoint(mouse_pos):
+                    self.toggle_editor()
+        
         # Update display
         pygame.display.flip()
     
@@ -2129,13 +2357,13 @@ class OSSim:
                     if self.rename_mode:
                         if self.selected_file:
                             # Extract just the filename from the full path
-                            old_filename = self.selected_file.split("/")[-1]
+                            old_filename = self.selected_file.lstrip('/')
                             new_filename = self.text_input.text
                             
                             # Rename file
                             if self.filesystem.rename_file(old_filename, new_filename):
                                 self.status_message = f"Renamed to {new_filename}"
-                                self.selected_file = f"{self.filesystem.current_dir}{new_filename}"
+                                self.selected_file = new_filename
                             else:
                                 self.status_message = "Rename failed - file already exists or invalid name"
                         else:
@@ -2165,20 +2393,12 @@ class OSSim:
                     for i, fname in enumerate(list(self.filesystem.files.keys())[self.file_scroll:self.file_scroll + Config.MAX_DISPLAY_FILES]):
                         file_y = 260 + i * 30
                         if file_y <= event.pos[1] <= file_y + 30:
-                            self.selected_file = fname
-                            self.status_message = f"Selected: {fname} - {self.filesystem.read_file(fname)}"
+                            self.selected_file = fname.lstrip('/')
+                            self.status_message = f"Selected: {self.selected_file}"
                             if event.button == 3:  # Right click
                                 self.rename_mode = True
-                                self.text_input.text = fname
+                                self.text_input.text = self.selected_file
                                 self.text_input.active = True
-                
-                # Handle scrollbar
-                if 770 <= event.pos[0] <= 790 and 260 <= event.pos[1] <= 350:
-                    if event.button == 4:  # Scroll up
-                        self.file_scroll = max(0, self.file_scroll - 1)
-                    elif event.button == 5:  # Scroll down
-                        max_scroll = max(0, len(self.filesystem.files) - Config.MAX_DISPLAY_FILES)
-                        self.file_scroll = min(max_scroll, self.file_scroll + 1)
                 
                 # Handle directory item selection
                 if 10 <= event.pos[0] <= 390 and 490 <= event.pos[1] <= 590:
@@ -2186,8 +2406,12 @@ class OSSim:
                     start_idx = self.directory_scroll
                     clicked_idx = (event.pos[1] - 490) // 25
                     
-                    if start_idx + clicked_idx < len(self.filesystem.list_contents()):
-                        self.selected_directory_item = self.filesystem.list_contents()[start_idx + clicked_idx]
+                    # Get directory contents
+                    dir_contents = self.filesystem.list_contents()
+                    
+                    # Check if the clicked index is valid
+                    if 0 <= clicked_idx < items_per_page and start_idx + clicked_idx < len(dir_contents):
+                        self.selected_directory_item = dir_contents[start_idx + clicked_idx]
                         
                         # Handle double click
                         if event.button == 1:  # Left click
@@ -2195,7 +2419,9 @@ class OSSim:
                             if type_ == "dir":
                                 self.filesystem.change_directory(name)
                             else:
-                                self.selected_file = f"{self.filesystem.current_dir}{name}"
+                                self.selected_file = name
+                                if name.endswith('.txt'):
+                                    self.toggle_editor()
                         
                         # Handle right click for context menu
                         elif event.button == 3:  # Right click
@@ -2204,6 +2430,14 @@ class OSSim:
                                 self.filesystem.delete_directory(name)
                             else:
                                 self.filesystem.delete_file(name)
+                
+                # Handle scrollbar
+                if 770 <= event.pos[0] <= 790 and 260 <= event.pos[1] <= 350:
+                    if event.button == 4:  # Scroll up
+                        self.file_scroll = max(0, self.file_scroll - 1)
+                    elif event.button == 5:  # Scroll down
+                        max_scroll = max(0, len(self.filesystem.files) - Config.MAX_DISPLAY_FILES)
+                        self.file_scroll = min(max_scroll, self.file_scroll + 1)
                 
                 # Handle directory scrollbar
                 if self.scrollbar_info:
@@ -2260,6 +2494,21 @@ class OSSim:
                 if self.active_tooltip:
                     self.active_tooltip.hide()
                     self.active_tooltip = None
+            
+            # Handle text editor events
+            if self.editor_active:
+                self.handle_editor_events(event)
+                
+                # Handle editor window close
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    mouse_pos = pygame.mouse.get_pos()
+                    editor_x, editor_y = 200, 200
+                    editor_width, editor_height = 600, 400
+                    
+                    # Check if click is outside editor window
+                    if not (editor_x <= mouse_pos[0] <= editor_x + editor_width and 
+                           editor_y <= mouse_pos[1] <= editor_y + editor_height):
+                        self.toggle_editor()
     
     def run(self):
         """Main simulation loop."""
@@ -2290,6 +2539,154 @@ class OSSim:
         self.text_input.active = True
         self.text_input.text = ""
         self.status_message = "Enter directory name"
+
+    def toggle_editor(self):
+        """Toggle the text editor window."""
+        if not self.selected_file:
+            self.status_message = "No file selected"
+            return
+
+        # Clean the filename by removing any leading slashes
+        filename = self.selected_file.lstrip('/')
+        
+        # Check if the file is a text file
+        if not filename.endswith('.txt'):
+            self.status_message = "Can only edit .txt files"
+            return
+
+        # Read the file content
+        content = self.filesystem.read_file(filename)
+        if content is None:
+            self.status_message = f"Failed to read file: {filename}"
+            return
+
+        # Store current window size
+        current_size = pygame.display.get_surface().get_size()
+        
+        # Initialize the editor with the file content
+        self.editor = TextEditor(self.font)
+        self.editor.initialize()
+        self.editor.open(filename, content)
+        
+        # Run the editor in a separate window
+        self.editor.run(self.filesystem)
+        
+        # Clear the editor reference after it's closed
+        self.editor = None
+        
+        # Restore main window size
+        pygame.display.set_mode((Config.WIDTH, Config.HEIGHT))
+        
+        self.status_message = f"Closed editor for {filename}"
+
+    def draw_editor(self, screen):
+        """Draw the text editor interface."""
+        if not self.editor_active:
+            return
+            
+        # Draw editor window
+        editor_x, editor_y = 200, 200
+        editor_width, editor_height = 600, 400
+        pygame.draw.rect(screen, Config.WHITE, (editor_x, editor_y, editor_width, editor_height))
+        pygame.draw.rect(screen, Config.BLACK, (editor_x, editor_y, editor_width, editor_height), 2)
+        
+        # Draw title
+        title = f"Editing: {self.edited_file}"
+        title_surf = self.font.render(title, True, Config.BLACK)
+        screen.blit(title_surf, (editor_x + 10, editor_y + 10))
+        
+        # Draw content area
+        content_area = pygame.Rect(editor_x + 10, editor_y + 40, editor_width - 20, editor_height - 80)
+        pygame.draw.rect(screen, Config.WHITE, content_area)
+        pygame.draw.rect(screen, Config.GRAY, content_area, 1)
+        
+        # Draw text content
+        lines = self.editor_content.split('\n')
+        visible_lines = (content_area.height - 20) // 20  # Approximate lines that fit
+        
+        for i, line in enumerate(lines[self.editor_scroll:self.editor_scroll + visible_lines]):
+            line_surf = self.font.render(line, True, Config.BLACK)
+            screen.blit(line_surf, (content_area.x + 5, content_area.y + 5 + i * 20))
+        
+        # Draw cursor
+        cursor_x = content_area.x + 5 + self.font.size(self.editor_content[:self.editor_cursor])[0]
+        cursor_y = content_area.y + 5 + (self.editor_cursor - self.editor_scroll) * 20
+        pygame.draw.line(screen, Config.BLACK, (cursor_x, cursor_y), (cursor_x, cursor_y + 15), 2)
+        
+        # Draw scrollbar
+        if len(lines) > visible_lines:
+            scrollbar_x = content_area.x + content_area.width - 20
+            scrollbar_height = content_area.height
+            handle_height = max(30, scrollbar_height * visible_lines / len(lines))
+            handle_y = content_area.y + (self.editor_scroll / (len(lines) - visible_lines)) * (scrollbar_height - handle_height)
+            
+            pygame.draw.rect(screen, Config.GRAY, (scrollbar_x, content_area.y, 20, scrollbar_height), 1)
+            pygame.draw.rect(screen, Config.DARK_GRAY, (scrollbar_x, handle_y, 20, handle_height))
+        
+        # Draw buttons
+        save_button = pygame.Rect(editor_x + editor_width - 100, editor_y + editor_height - 30, 80, 25)
+        close_button = pygame.Rect(editor_x + 10, editor_y + editor_height - 30, 80, 25)
+        
+        pygame.draw.rect(screen, Config.GREEN, save_button)
+        pygame.draw.rect(screen, Config.RED, close_button)
+        
+        save_text = self.font.render("Save", True, Config.WHITE)
+        close_text = self.font.render("Close", True, Config.WHITE)
+        
+        screen.blit(save_text, (save_button.x + 25, save_button.y + 5))
+        screen.blit(close_text, (close_button.x + 20, close_button.y + 5))
+        
+        return save_button, close_button
+
+    def handle_editor_events(self, event):
+        """Handle text editor input events."""
+        if not self.editor_active:
+            return
+            
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_BACKSPACE:
+                if self.editor_cursor > 0:
+                    self.editor_content = self.editor_content[:self.editor_cursor-1] + self.editor_content[self.editor_cursor:]
+                    self.editor_cursor -= 1
+            elif event.key == pygame.K_DELETE:
+                if self.editor_cursor < len(self.editor_content):
+                    self.editor_content = self.editor_content[:self.editor_cursor] + self.editor_content[self.editor_cursor+1:]
+            elif event.key == pygame.K_LEFT:
+                self.editor_cursor = max(0, self.editor_cursor - 1)
+            elif event.key == pygame.K_RIGHT:
+                self.editor_cursor = min(len(self.editor_content), self.editor_cursor + 1)
+            elif event.key == pygame.K_UP:
+                # Move cursor up one line
+                current_line_start = self.editor_content.rfind('\n', 0, self.editor_cursor)
+                if current_line_start != -1:
+                    prev_line_start = self.editor_content.rfind('\n', 0, current_line_start)
+                    if prev_line_start != -1:
+                        self.editor_cursor = prev_line_start + (self.editor_cursor - current_line_start)
+                    else:
+                        self.editor_cursor = 0
+            elif event.key == pygame.K_DOWN:
+                # Move cursor down one line
+                current_line_start = self.editor_content.rfind('\n', 0, self.editor_cursor)
+                next_line_start = self.editor_content.find('\n', self.editor_cursor)
+                if next_line_start != -1:
+                    self.editor_cursor = next_line_start + 1
+            elif event.key == pygame.K_RETURN:
+                self.editor_content = self.editor_content[:self.editor_cursor] + '\n' + self.editor_content[self.editor_cursor:]
+                self.editor_cursor += 1
+            else:
+                # Add regular characters
+                self.editor_content = self.editor_content[:self.editor_cursor] + event.unicode + self.editor_content[self.editor_cursor:]
+                self.editor_cursor += 1
+            
+            # Update scroll position
+            lines = self.editor_content.split('\n')
+            current_line = len(self.editor_content[:self.editor_cursor].split('\n')) - 1
+            visible_lines = 18  # Approximate number of visible lines
+            
+            if current_line < self.editor_scroll:
+                self.editor_scroll = current_line
+            elif current_line >= self.editor_scroll + visible_lines:
+                self.editor_scroll = current_line - visible_lines + 1
 
 # Run the simulator
 if __name__ == "__main__":
