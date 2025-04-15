@@ -94,5 +94,5 @@ Pickle-based Save/Load of the full simulation state.
 
 📋 Logging
 All major actions are logged with timestamps in a file for analysis.
-
+ADDED A NEW TEXT EDITOR FEATURE
 
