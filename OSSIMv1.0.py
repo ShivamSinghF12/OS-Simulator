@@ -4,6 +4,7 @@ import os
 import logging
 import pickle
 from datetime import datetime
+import math
 
 # Setup logging
 
@@ -128,9 +129,6 @@ class Scheduler:
     
     def step(self):
         """Advance the simulation by one time unit."""
-        if self.paused:
-            return
-
         try:
             previous_terminated_count = len(self.terminated)
 
@@ -143,6 +141,11 @@ class Scheduler:
                     self.ready_queue.append(process)
                     self.io_queue.pop(i)
                     logger.info(f"Process {process.pid} returned from IO")
+                    # Update Gantt chart for IO completion
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.current_time))
+                    self.last_pid = process.pid
+                    self.last_start_time = self.current_time
 
             # Select a process to run if none is running
             if not self.current_process:
@@ -168,6 +171,11 @@ class Scheduler:
                 if self.current_process:
                     self.current_process.state = "Running"
                     logger.info(f"Selected process {self.current_process.pid} to run")
+                    # Update Gantt chart for new process
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.current_time))
+                    self.last_pid = self.current_process.pid
+                    self.last_start_time = self.current_time
 
             # Process execution
             if self.current_process:
@@ -187,6 +195,10 @@ class Scheduler:
                     self.current_process.io_wait_time = random.randint(1, 5)
                     self.io_queue.append(self.current_process)
                     logger.info(f"Process {self.current_process.pid} requested IO, waiting for {self.current_process.io_wait_time}")
+                    # Update Gantt chart for IO start
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.current_time))
+                    self.last_pid = None
                     self.current_process = None
                     return
                 
@@ -196,32 +208,97 @@ class Scheduler:
                     if not hasattr(proc, "held_resources"):
                         proc.held_resources = []
 
-                    # Randomly request a resource
-                    if random.random() < 0.3:  # 30% chance to request a resource
-                        res = random.choice(["Printer", "Disk", "Scanner"])
-                        if self.resource_manager.request(proc.pid, res):
-                            proc.held_resources.append(res)
-                            logger.info(f"Process {proc.pid} acquired resource {res}")
-                        else:
+                    # Only apply deadlock simulation to IO-bound processes
+                    if proc.io_bound:
+                        # If process is not holding any resources, it must acquire one first
+                        if not proc.held_resources:
+                            # Try to acquire any available resource
+                            available_resources = ["Printer", "Disk", "Scanner"]
+                            for resource in available_resources:
+                                if self.resource_manager.request(proc.pid, resource):
+                                    proc.held_resources.append(resource)
+                                    logger.info(f"Process {proc.pid} acquired resource {resource}")
+                                    return
+                            
+                            # If no resources available, process is blocked
                             proc.state = "Blocked"
-                            self.ready_queue.append(proc)
-                            self.current_process = None
+                            self.scheduler.ready_queue.append(proc)
+                            self.scheduler.current_process = None
                             self.blocked_processes.append(proc)
-                            logger.info(f"Process {proc.pid} blocked requesting {res}")
+                            logger.info(f"Process {proc.pid} blocked - no resources available")
+                            # Update Gantt chart for blocking
+                            if self.last_pid is not None:
+                                self.execution_history.append((self.last_pid, self.last_start_time, self.current_time))
+                            self.last_pid = None
                             return
+                        
+                        # If process is holding a resource, it can request another one
+                        elif random.random() < 0.3:  # 30% chance to request another resource
+                            available_resources = ["Printer", "Disk", "Scanner"]
+                            current_resource = proc.held_resources[0]
+                            
+                            # Try to request a different resource
+                            for resource in available_resources:
+                                if resource != current_resource:  # Don't request the same resource
+                                    for other_pid, resources in self.resource_manager.allocated.items():
+                                        if resource in resources and other_pid != proc.pid:
+                                            if self.resource_manager.request(proc.pid, resource):
+                                                proc.held_resources.append(resource)
+                                                logger.info(f"Process {proc.pid} acquired additional resource {resource}")
+                                            else:
+                                                proc.state = "Blocked"
+                                                self.scheduler.ready_queue.append(proc)
+                                                self.scheduler.current_process = None
+                                                self.blocked_processes.append(proc)
+                                                logger.info(f"Process {proc.pid} blocked requesting {resource} while holding {current_resource}")
+                                                # Update Gantt chart for blocking
+                                                if self.last_pid is not None:
+                                                    self.execution_history.append((self.last_pid, self.last_start_time, self.current_time))
+                                                self.last_pid = None
+                                                return
+                        
+                        # Process can release its resource
+                        elif random.random() < 0.2:  # 20% chance to release the resource
+                            resource = proc.held_resources[0]
+                            self.resource_manager.release(proc.pid)
+                            proc.held_resources.remove(resource)
+                            logger.info(f"Process {proc.pid} released resource {resource}")
 
                 # Check if process completed
                 if self.current_process.remaining_time <= 0:
                     self.current_process.state = "Terminated"
                     self.current_process.completion_time = self.current_time
                     self.terminated.append(self.current_process)
+                    
+                    # Clean up memory and resources for completed process
+                    if self.current_process in self.memory.allocated:
+                        start, size = self.memory.allocated[self.current_process]
+                        self.memory.blocks.append((start, size))
+                        del self.memory.allocated[self.current_process]
+                        self.memory._merge_adjacent_blocks()
+                    
+                    self.resource_manager.release(self.current_process.pid)
                     logger.info(f"Process {self.current_process.pid} terminated at time {self.current_time}")
+                    # Update Gantt chart for termination
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.current_time))
+                    self.last_pid = None
                     self.current_process = None
+                    
+                    # Play termination sound and update status
+                    if self.terminate_sound:
+                        self.terminate_sound.play()
+                    self.status_message = f"Process {self.terminated[-1].pid} terminated"
+                    self.update_performance_metrics()
                 # Check if time quantum expired for Round Robin
                 elif self.algorithm == "RR" and self.time_slice >= self.quantum:
                     self.current_process.state = "Ready"
                     self.ready_queue.append(self.current_process)
                     logger.info(f"Process {self.current_process.pid} time quantum expired, returning to ready queue")
+                    # Update Gantt chart for quantum expiration
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.current_time))
+                    self.last_pid = None
                     self.current_process = None
                     self.time_slice = 0
 
@@ -254,13 +331,26 @@ class Scheduler:
                 deadlock_detected, deadlock_info = self.resource_manager.detect_deadlock()
                 if deadlock_detected:
                     status_parts = ["⚠️ Deadlock detected!"]
-                    for info in deadlock_info:
-                        status_parts.append(f"PID {info['pid']}: Holding {info['holding']}, Waiting for {info['waiting_for']}")
+                    for cycle in deadlock_info:
+                        for pid, resource in cycle:
+                            # Get what the process is holding
+                            holding = []
+                            for held_pid, resources in self.resource_manager.allocated.items():
+                                if held_pid == pid:
+                                    holding.extend(resources)
+                            
+                            # Get what the process is waiting for
+                            waiting_for = []
+                            for req_pid, resources in self.resource_manager.requests.items():
+                                if req_pid == pid:
+                                    waiting_for.extend(resources)
+                            
+                            status_parts.append(f"PID {pid}: Holding {holding if holding else 'nothing'}, Waiting for {waiting_for if waiting_for else 'nothing'}")
                     self.status_message = "\n".join(status_parts)
 
         except Exception as e:
-            logger.error(f"Error in step function: {e}")
-            self.status_message = f"Error in simulation step: {str(e)}"
+            logger.error(f"Error in step: {e}")
+            self.status_message = f"Error: {str(e)}"
 
     def change_algorithm(self, algorithm):
         self.algorithm = algorithm
@@ -855,75 +945,80 @@ class ResourceManager:
             del self.requests[pid]
 
     def detect_deadlock(self):
-        """Detect deadlock using the wait-for graph algorithm and return detailed information"""
-        # Build wait-for graph
+        """Detect deadlock using resource allocation graph."""
+        # Build resource allocation graph
         graph = {}
-        process_info = {}  # Store process and resource information
         
-        # Add edges from processes to resources they're waiting for
-        for pid, waiting_for in self.requests.items():
-            for resource in waiting_for:
-                holder = self.resources[resource]
-                if holder is not None:
-                    if f"P{pid}" not in graph:
-                        graph[f"P{pid}"] = []
-                    graph[f"P{pid}"].append(f"P{holder}")
-                    
-                    # Store process and resource information
-                    if pid not in process_info:
-                        process_info[pid] = {"waiting_for": [], "holding": []}
-                    process_info[pid]["waiting_for"].append(resource)
-        
-        # Add information about held resources
+        # Add edges for resources each process is holding
         for pid, resources in self.allocated.items():
-            if pid not in process_info:
-                process_info[pid] = {"waiting_for": [], "holding": []}
-            process_info[pid]["holding"] = resources
+            if pid not in graph:
+                graph[pid] = set()
+            for resource in resources:
+                if resource not in graph:
+                    graph[resource] = set()
+                graph[pid].add(resource)  # Process -> Resource edge
         
-        # Check for cycles in the graph
+        # Add edges for resources each process is waiting for
+        for pid, resources in self.requests.items():
+            if pid not in graph:
+                graph[pid] = set()
+            for resource in resources:
+                if resource not in graph:
+                    graph[resource] = set()
+                graph[resource].add(pid)  # Resource -> Process edge
+        
+        # Add edges for IO-bound processes
+        for pid, resources in self.allocated.items():
+            if pid not in graph:
+                graph[pid] = set()
+            # Add an edge to represent IO wait
+            graph[pid].add("IO")  # Process -> IO edge
+            if "IO" not in graph:
+                graph["IO"] = set()
+            graph["IO"].add(pid)  # IO -> Process edge
+        
+        # Detect cycles using DFS
         visited = set()
-        stack = set()
-        deadlock_cycle = []
+        path = []
+        cycles = []
         
         def dfs(node):
-            if node in stack:
-                deadlock_cycle.append(node)
-                return True  # Cycle detected
+            if node in path:
+                cycle_start = path.index(node)
+                cycle = path[cycle_start:]
+                if len(cycle) >= 4:  # Ensure it's a valid deadlock cycle (at least 2 processes and 2 resources)
+                    cycles.append(cycle)
+                return
+            
             if node in visited:
-                return False
+                return
             
             visited.add(node)
-            stack.add(node)
+            path.append(node)
             
-            for neighbor in graph.get(node, []):
-                if dfs(neighbor):
-                    if node not in deadlock_cycle:
-                        deadlock_cycle.append(node)
-                    return True
+            for neighbor in graph.get(node, set()):
+                dfs(neighbor)
             
-            stack.remove(node)
-            return False
+            path.pop()
         
-        # Check each process for cycles
+        # Start DFS from each node
         for node in graph:
-            if dfs(node):
-                # Extract process IDs from the cycle
-                deadlocked_pids = [int(p[1:]) for p in deadlock_cycle]
-                
-                # Build detailed deadlock information
-                deadlock_info = []
-                for pid in deadlocked_pids:
-                    info = process_info.get(pid, {})
-                    deadlock_info.append({
-                        "pid": pid,
-                        "waiting_for": info.get("waiting_for", []),
-                        "holding": info.get("holding", [])
-                    })
-                
-                logger.info("Deadlock detected with detailed information")
-                return True, deadlock_info
+            if node not in visited:
+                dfs(node)
         
-        return False, []
+        if not cycles:
+            return False, []
+        
+        # Convert cycles to process-resource pairs
+        deadlock_info = []
+        for cycle in cycles:
+            cycle_info = []
+            for i in range(0, len(cycle), 2):
+                if i + 1 < len(cycle):
+                    cycle_info.append((cycle[i], cycle[i + 1]))
+            deadlock_info.append(cycle_info)
+        
+        return True, deadlock_info
 
     def get_deadlocked_processes(self):
         """Get list of processes involved in deadlock"""
@@ -1216,12 +1311,10 @@ class OSSim:
         self.editor_cursor = 0
         self.editor_scroll = 0
         
-        # Add editor button
-        self.buttons.append(Button(10, 810, 150, 30, "Text Editor", Config.BLUE, self.toggle_editor))
-        
         # Initialize text editor
         self.text_editor = TextEditor(self.font)
-
+        self.deadlock_visualizer = None
+        
     def _create_buttons(self):
         return [
         Button(10, 770, 150, 30, "Toggle Deadlock", Config.ORANGE, self.toggle_deadlock),
@@ -1244,6 +1337,7 @@ class OSSim:
         Button(330, 770, 150, 30, "Reset Simulator", Config.RED, self.reset_simulator),
         Button(650, 770, 150, 30, "Create Directory", Config.LIGHT_GREEN, self.create_directory),
         Button(490, 770, 150, 30, "Rename File", Config.BLUE, self.rename_selected_file),
+        Button(820, 770, 150, 30, "Show Deadlock", Config.PURPLE, self.show_deadlock_visualization)
     ]
     
     def _create_tooltips(self):
@@ -1266,6 +1360,7 @@ class OSSim:
             "Reset Simulator": Tooltip("Reset the simulator to initial state", self.font),
             "Create Directory": Tooltip("Create a new directory in the current location", self.font),
             "Rename File": Tooltip("Rename the selected file", self.font),
+            "Show Deadlock": Tooltip("Show deadlock visualization", self.font)
         }
 
     def rename_selected_file(self):
@@ -1295,9 +1390,6 @@ class OSSim:
     
     def step(self):
         """Advance the simulation by one time unit."""
-        if self.paused:
-            return
-
         try:
             previous_terminated_count = len(self.scheduler.terminated)
 
@@ -1310,6 +1402,11 @@ class OSSim:
                     self.scheduler.ready_queue.append(process)
                     self.scheduler.io_queue.pop(i)
                     logger.info(f"Process {process.pid} returned from IO")
+                    # Update Gantt chart for IO completion
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+                    self.last_pid = process.pid
+                    self.last_start_time = self.scheduler.current_time
 
             # Select a process to run if none is running
             if not self.scheduler.current_process:
@@ -1335,6 +1432,11 @@ class OSSim:
                 if self.scheduler.current_process:
                     self.scheduler.current_process.state = "Running"
                     logger.info(f"Selected process {self.scheduler.current_process.pid} to run")
+                    # Update Gantt chart for new process
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+                    self.last_pid = self.scheduler.current_process.pid
+                    self.last_start_time = self.scheduler.current_time
 
             # Process execution
             if self.scheduler.current_process:
@@ -1354,6 +1456,10 @@ class OSSim:
                     self.scheduler.current_process.io_wait_time = random.randint(1, 5)
                     self.scheduler.io_queue.append(self.scheduler.current_process)
                     logger.info(f"Process {self.scheduler.current_process.pid} requested IO, waiting for {self.scheduler.current_process.io_wait_time}")
+                    # Update Gantt chart for IO start
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+                    self.last_pid = None
                     self.scheduler.current_process = None
                     return
                 
@@ -1363,19 +1469,61 @@ class OSSim:
                     if not hasattr(proc, "held_resources"):
                         proc.held_resources = []
 
-                    # Randomly request a resource
-                    if random.random() < 0.3:  # 30% chance to request a resource
-                        res = random.choice(["Printer", "Disk", "Scanner"])
-                        if self.resource_manager.request(proc.pid, res):
-                            proc.held_resources.append(res)
-                            logger.info(f"Process {proc.pid} acquired resource {res}")
-                        else:
+                    # Only apply deadlock simulation to IO-bound processes
+                    if proc.io_bound:
+                        # If process is not holding any resources, it must acquire one first
+                        if not proc.held_resources:
+                            # Try to acquire any available resource
+                            available_resources = ["Printer", "Disk", "Scanner"]
+                            for resource in available_resources:
+                                if self.resource_manager.request(proc.pid, resource):
+                                    proc.held_resources.append(resource)
+                                    logger.info(f"Process {proc.pid} acquired resource {resource}")
+                                    return
+                            
+                            # If no resources available, process is blocked
                             proc.state = "Blocked"
                             self.scheduler.ready_queue.append(proc)
                             self.scheduler.current_process = None
                             self.blocked_processes.append(proc)
-                            logger.info(f"Process {proc.pid} blocked requesting {res}")
+                            logger.info(f"Process {proc.pid} blocked - no resources available")
+                            # Update Gantt chart for blocking
+                            if self.last_pid is not None:
+                                self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+                            self.last_pid = None
                             return
+                        
+                        # If process is holding a resource, it can request another one
+                        elif random.random() < 0.3:  # 30% chance to request another resource
+                            available_resources = ["Printer", "Disk", "Scanner"]
+                            current_resource = proc.held_resources[0]
+                            
+                            # Try to request a different resource
+                            for resource in available_resources:
+                                if resource != current_resource:  # Don't request the same resource
+                                    for other_pid, resources in self.resource_manager.allocated.items():
+                                        if resource in resources and other_pid != proc.pid:
+                                            if self.resource_manager.request(proc.pid, resource):
+                                                proc.held_resources.append(resource)
+                                                logger.info(f"Process {proc.pid} acquired additional resource {resource}")
+                                            else:
+                                                proc.state = "Blocked"
+                                                self.scheduler.ready_queue.append(proc)
+                                                self.scheduler.current_process = None
+                                                self.blocked_processes.append(proc)
+                                                logger.info(f"Process {proc.pid} blocked requesting {resource} while holding {current_resource}")
+                                                # Update Gantt chart for blocking
+                                                if self.last_pid is not None:
+                                                    self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+                                                self.last_pid = None
+                                                return
+                        
+                        # Process can release its resource
+                        elif random.random() < 0.2:  # 20% chance to release the resource
+                            resource = proc.held_resources[0]
+                            self.resource_manager.release(proc.pid)
+                            proc.held_resources.remove(resource)
+                            logger.info(f"Process {proc.pid} released resource {resource}")
 
                 # Check if process completed
                 if self.scheduler.current_process.remaining_time <= 0:
@@ -1392,12 +1540,26 @@ class OSSim:
                     
                     self.resource_manager.release(self.scheduler.current_process.pid)
                     logger.info(f"Process {self.scheduler.current_process.pid} terminated at time {self.scheduler.current_time}")
+                    # Update Gantt chart for termination
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+                    self.last_pid = None
                     self.scheduler.current_process = None
+                    
+                    # Play termination sound and update status
+                    if self.terminate_sound:
+                        self.terminate_sound.play()
+                    self.status_message = f"Process {self.scheduler.terminated[-1].pid} terminated"
+                    self.update_performance_metrics()
                 # Check if time quantum expired for Round Robin
                 elif self.scheduler.algorithm == "RR" and self.scheduler.time_slice >= self.scheduler.quantum:
                     self.scheduler.current_process.state = "Ready"
                     self.scheduler.ready_queue.append(self.scheduler.current_process)
                     logger.info(f"Process {self.scheduler.current_process.pid} time quantum expired, returning to ready queue")
+                    # Update Gantt chart for quantum expiration
+                    if self.last_pid is not None:
+                        self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+                    self.last_pid = None
                     self.scheduler.current_process = None
                     self.scheduler.time_slice = 0
 
@@ -1416,6 +1578,8 @@ class OSSim:
             # Handle termination
             if len(self.scheduler.terminated) > previous_terminated_count:
                 terminated_proc = self.scheduler.terminated[-1]
+                self.memory.deallocate(terminated_proc)
+                self.resource_manager.release(terminated_proc.pid)
                 self.status_message = f"Process {terminated_proc.pid} terminated"
 
                 if self.terminate_sound:
@@ -1428,13 +1592,26 @@ class OSSim:
                 deadlock_detected, deadlock_info = self.resource_manager.detect_deadlock()
                 if deadlock_detected:
                     status_parts = ["⚠️ Deadlock detected!"]
-                    for info in deadlock_info:
-                        status_parts.append(f"PID {info['pid']}: Holding {info['holding']}, Waiting for {info['waiting_for']}")
+                    for cycle in deadlock_info:
+                        for pid, resource in cycle:
+                            # Get what the process is holding
+                            holding = []
+                            for held_pid, resources in self.resource_manager.allocated.items():
+                                if held_pid == pid:
+                                    holding.extend(resources)
+                            
+                            # Get what the process is waiting for
+                            waiting_for = []
+                            for req_pid, resources in self.resource_manager.requests.items():
+                                if req_pid == pid:
+                                    waiting_for.extend(resources)
+                            
+                            status_parts.append(f"PID {pid}: Holding {holding if holding else 'nothing'}, Waiting for {waiting_for if waiting_for else 'nothing'}")
                     self.status_message = "\n".join(status_parts)
 
         except Exception as e:
-            logger.error(f"Error in step function: {e}")
-            self.status_message = f"Error in simulation step: {str(e)}"
+            logger.error(f"Error in step: {e}")
+            self.status_message = f"Error: {str(e)}"
 
     def create_file(self):
         """Create a new file in the file system with enhanced features."""
@@ -1599,105 +1776,205 @@ class OSSim:
         self.status_message = f"Deadlock simulation {state}"
 
     def resolve_deadlock(self):
-        """Resolve deadlock by terminating a process involved in the deadlock"""
+        """Resolve deadlock by terminating an IO-bound process involved in the deadlock."""
         if not self.deadlock_simulation_enabled:
-            self.status_message = "Deadlock simulation is not enabled"
             return
 
-        # Check if there's only one blocked process
-        if len(self.blocked_processes) == 1:
-            single_blocked = self.blocked_processes[0]
-            
-            # Check if the process is waiting for resources that are now available
-            if hasattr(single_blocked, "held_resources"):
-                can_unblock = True
-                for res in single_blocked.held_resources:
-                    if self.resource_manager.resources[res] is not None:
-                        can_unblock = False
-                        break
-                
-                if can_unblock:
-                    # Unblock the process
-                    single_blocked.state = "Ready"
-                    self.scheduler.ready_queue.append(single_blocked)
-                    self.blocked_processes.remove(single_blocked)
-                    self.status_message = f"Process {single_blocked.pid} automatically unblocked - no other processes to hold resources"
-                    return
-
-        # Build PID to Process mapping
-        pid_map = {}
-        if self.scheduler.current_process:
-            pid_map[self.scheduler.current_process.pid] = self.scheduler.current_process
-        for proc in self.scheduler.ready_queue + self.scheduler.io_queue + self.blocked_processes:
-            pid_map[proc.pid] = proc
-
-        # Detect deadlock and get detailed information
+        # Get deadlock information
         deadlock_detected, deadlock_info = self.resource_manager.detect_deadlock()
         
         if not deadlock_detected:
-            self.status_message = "No deadlock to resolve"
+            self.status_message = "No deadlock detected"
             return
 
-        # Get process instances from detected deadlock info
-        deadlocked_processes = [pid_map[info["pid"]] for info in deadlock_info if info["pid"] in pid_map]
-
-        if not deadlocked_processes:
-            self.status_message = "No deadlock to resolve"
+        # Get all IO-bound processes involved in the deadlock
+        io_bound_deadlocked = []
+        for cycle in deadlock_info:
+            for pid, _ in cycle:
+                # Find the process in all queues
+                process = None
+                for p in (self.scheduler.ready_queue + 
+                         self.scheduler.io_queue + 
+                         self.blocked_processes + 
+                         [self.scheduler.current_process]):
+                    if p and p.pid == pid and p.io_bound:
+                        process = p
+                        break
+                
+                if process and process not in io_bound_deadlocked:
+                    io_bound_deadlocked.append(process)
+        
+        if not io_bound_deadlocked:
+            self.status_message = "No IO-bound processes found in deadlock"
             return
 
-        # Terminate the victim process
-        victim = min(deadlocked_processes, key=lambda p: p.priority)
-        victim.state = "Terminated"
-        victim.completion_time = self.scheduler.current_time
-        self.scheduler.terminated.append(victim)
+        # Select the process with the lowest priority to terminate
+        process_to_terminate = min(io_bound_deadlocked, key=lambda p: p.priority)
+        
+        # Log the termination
+        logger.info(f"Resolving deadlock by terminating IO-bound process {process_to_terminate.pid}")
+        
+        # Store the resources that will be freed
+        freed_resources = []
+        if process_to_terminate.pid in self.resource_manager.allocated:
+            freed_resources = self.resource_manager.allocated[process_to_terminate.pid].copy()
+        
+        # Terminate the process and set completion time
+        process_to_terminate.state = "Terminated"
+        process_to_terminate.completion_time = self.scheduler.current_time
+        process_to_terminate.remaining_time = 0  # Ensure process is marked as completed
+        
+        # Remove from all queues
+        for queue in [self.scheduler.ready_queue, 
+                     self.scheduler.io_queue, 
+                     self.blocked_processes]:
+            if process_to_terminate in queue:
+                queue.remove(process_to_terminate)
+        
+        if self.scheduler.current_process == process_to_terminate:
+            self.scheduler.current_process = None
+        
+        # Add to terminated queue
+        self.scheduler.terminated.append(process_to_terminate)
         
         # Clean up memory
-        if victim in self.memory.allocated:
-            start, size = self.memory.allocated[victim]
+        if process_to_terminate in self.memory.allocated:
+            start, size = self.memory.allocated[process_to_terminate]
             self.memory.blocks.append((start, size))
-            del self.memory.allocated[victim]
+            del self.memory.allocated[process_to_terminate]
             self.memory._merge_adjacent_blocks()
         
         # Release all resources
-        self.resource_manager.release(victim.pid)
-        
-        # Remove victim from queues
-        for queue in [self.scheduler.ready_queue, self.scheduler.io_queue, self.blocked_processes]:
-            if victim in queue:
-                queue.remove(victim)
-        if self.scheduler.current_process == victim:
-            self.scheduler.current_process = None
+        self.resource_manager.release(process_to_terminate.pid)
         
         # Remove from resource manager maps
-        self.resource_manager.requests.pop(victim.pid, None)
-        self.resource_manager.allocated.pop(victim.pid, None)
-
-        # Attempt to unblock other processes after resolution
-        new_blocked = []
-        for proc in self.blocked_processes:
-            still_blocked = False
-            for res in getattr(proc, "held_resources", []):
-                if self.resource_manager.resources[res] not in (None, proc.pid):
-                    still_blocked = True
-                    break
-            if not still_blocked:
-                proc.state = "Ready"
-                self.scheduler.ready_queue.append(proc)
-            else:
-                new_blocked.append(proc)
-
-        self.blocked_processes = new_blocked
-
-        # Build status message
-        status_parts = [f"Resolved deadlock by terminating PID {victim.pid}"]
-        status_parts.append("Deadlock involved:")
-        for info in deadlock_info:
-            status_parts.append(f"PID {info['pid']}: Holding {info['holding']}, Waiting for {info['waiting_for']}")
+        if process_to_terminate.pid in self.resource_manager.requests:
+            del self.resource_manager.requests[process_to_terminate.pid]
+        if process_to_terminate.pid in self.resource_manager.allocated:
+            del self.resource_manager.allocated[process_to_terminate.pid]
         
-        self.status_message = "\n".join(status_parts)
+        # Check for processes that can be unblocked
+        unblocked_processes = []
+        for process in self.blocked_processes[:]:  # Create a copy to safely modify
+            if not hasattr(process, "held_resources"):
+                continue
+                
+            # Check if the process can get all its requested resources
+            can_unblock = True
+            for resource in process.held_resources:
+                if self.resource_manager.resources[resource] is not None:
+                    can_unblock = False
+                    break
+            
+            if can_unblock:
+                # Try to acquire the resources
+                success = True
+                for resource in process.held_resources:
+                    if not self.resource_manager.request(process.pid, resource):
+                        success = False
+                        break
+                
+                if success:
+                    process.state = "Ready"
+                    self.scheduler.ready_queue.append(process)
+                    self.blocked_processes.remove(process)
+                    unblocked_processes.append(process)
+                    logger.info(f"Process {process.pid} unblocked after resource release")
+                    
+                    # If no process is currently running, schedule this one
+                    if not self.scheduler.current_process:
+                        self.scheduler.current_process = process
+                        self.scheduler.ready_queue.remove(process)
+                        process.state = "Running"
+                        logger.info(f"Process {process.pid} scheduled to run after unblocking")
+                        # Update Gantt chart for newly scheduled process
+                        if self.last_pid is not None:
+                            self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+                        self.last_pid = process.pid
+                        self.last_start_time = self.scheduler.current_time
+        
+        # Check if there's only one process remaining in memory
+        remaining_processes = [p for p in (self.scheduler.ready_queue + 
+                                         self.scheduler.io_queue + 
+                                         self.blocked_processes + 
+                                         [self.scheduler.current_process])
+                            if p and p != process_to_terminate]
+        
+        if len(remaining_processes) == 1:
+            # Complete the remaining process
+            remaining_process = remaining_processes[0]
+            logger.info(f"Completing remaining process {remaining_process.pid}")
+            
+            # Set remaining time to 0 and completion time
+            remaining_process.remaining_time = 0
+            remaining_process.completion_time = self.scheduler.current_time
+            
+            # Update Gantt chart
+            if self.last_pid is not None:
+                self.execution_history.append((self.last_pid, self.last_start_time, self.scheduler.current_time))
+            self.last_pid = remaining_process.pid
+            self.last_start_time = self.scheduler.current_time
+            
+            # Clean up resources and memory
+            self.resource_manager.release(remaining_process.pid)
+            if remaining_process in self.memory.allocated:
+                self.memory.deallocate(remaining_process)
+            
+            # Add to terminated list
+            self.scheduler.terminated.append(remaining_process)
+            
+            # Remove from any queues
+            if remaining_process in self.scheduler.ready_queue:
+                self.scheduler.ready_queue.remove(remaining_process)
+            if remaining_process in self.scheduler.io_queue:
+                self.scheduler.io_queue.remove(remaining_process)
+            if remaining_process in self.blocked_processes:
+                self.blocked_processes.remove(remaining_process)
+            
+            # Update status message to include completion of remaining process
+            status_parts = [
+                f"Deadlock resolved by terminating process {process_to_terminate.pid}",
+                f"Process {remaining_process.pid} completed and terminated",
+                f"All processes have been completed"
+            ]
+            self.status_message = "\n".join(status_parts)
+        else:
+            # Update status message with detailed information
+            status_parts = [f"Deadlock resolved by terminating IO-bound process {process_to_terminate.pid}"]
+            
+            # Add information about what resources were held and requested
+            holding = []
+            for held_pid, resources in self.resource_manager.allocated.items():
+                if held_pid == process_to_terminate.pid:
+                    holding.extend(resources)
+            
+            waiting_for = []
+            for req_pid, resources in self.resource_manager.requests.items():
+                if req_pid == process_to_terminate.pid:
+                    waiting_for.extend(resources)
+            
+            status_parts.append(f"Holding: {holding if holding else 'none'}")
+            status_parts.append(f"Waiting for: {waiting_for if waiting_for else 'none'}")
+            
+            # Add information about unblocked processes
+            if unblocked_processes:
+                status_parts.append("\nUnblocked processes:")
+                for process in unblocked_processes:
+                    status_parts.append(f"Process {process.pid} is now ready")
+                    if process == self.scheduler.current_process:
+                        status_parts.append(f"Process {process.pid} is now running")
+            
+            self.status_message = "\n".join(status_parts)
+        
+        # Play termination sound
+        if self.terminate_sound:
+            self.terminate_sound.play()
+        
+        # Update performance metrics
         self.update_performance_metrics()
+        
+        # Unpause the simulation
         self.paused = False
-
 
     def reset_simulator(self):
         """Reset the simulator to its initial state."""
@@ -1797,6 +2074,16 @@ class OSSim:
         title_text = self.font.render(f"Memory ({self.memory.algorithm})", True, Config.BLACK)
         screen.blit(title_text, (x + 10, y + 10))
         
+        # Add algorithm explanation
+        algo_explanation = {
+            "First-Fit": "Finds first block that fits",
+            "Best-Fit": "Finds smallest block that fits",
+            "Worst-Fit": "Finds largest block available"
+        }[self.memory.algorithm]
+        
+        explanation_text = self.font.render(algo_explanation, True, Config.BLUE)
+        screen.blit(explanation_text, (x + width - 200, y + 10))
+        
         # Draw memory blocks
         memory_height = height - 120  # Increased space for information
         scale_factor = memory_height / self.memory.total_size
@@ -1811,17 +2098,35 @@ class OSSim:
                 scale_text = self.font.render(f"{i}KB", True, Config.BLACK)
                 screen.blit(scale_text, (x + 115, scale_pos - 10))
         
-        # Draw free blocks (red with pattern)
+        # Draw free blocks with different patterns based on algorithm
         for start, size in self.memory.blocks:
             block_y = scale_y + int(start * scale_factor)
             block_height = max(1, int(size * scale_factor))
-            # Draw block with pattern
-            pygame.draw.rect(screen, Config.RED, (x + 10, block_y, 100, block_height))
-            # Draw diagonal lines for pattern
-            for i in range(0, block_height, 5):
-                pygame.draw.line(screen, (200, 0, 0), 
-                               (x + 10, block_y + i), 
-                               (x + 10 + min(100, i), block_y + i))
+            
+            # Different patterns for different algorithms
+            if self.memory.algorithm == "First-Fit":
+                # First Fit: Solid color with diagonal lines
+                pygame.draw.rect(screen, Config.RED, (x + 10, block_y, 100, block_height))
+                for i in range(0, block_height, 5):
+                    pygame.draw.line(screen, (200, 0, 0), 
+                                   (x + 10, block_y + i), 
+                                   (x + 10 + min(100, i), block_y + i))
+            elif self.memory.algorithm == "Best-Fit":
+                # Best Fit: Checkered pattern
+                pygame.draw.rect(screen, Config.RED, (x + 10, block_y, 100, block_height))
+                for i in range(0, block_height, 10):
+                    for j in range(0, 100, 10):
+                        if (i + j) % 20 == 0:
+                            pygame.draw.rect(screen, (200, 0, 0), 
+                                          (x + 10 + j, block_y + i, 10, 10))
+            else:  # Worst-Fit
+                # Worst Fit: Gradient pattern
+                pygame.draw.rect(screen, Config.RED, (x + 10, block_y, 100, block_height))
+                for i in range(0, block_height, 2):
+                    color = (200 - int(i * 100 / block_height), 0, 0)
+                    pygame.draw.line(screen, color, 
+                                   (x + 10, block_y + i), 
+                                   (x + 110, block_y + i))
         
         # Draw allocated blocks (green with process info)
         for proc, (start, size) in self.memory.allocated.items():
@@ -1891,61 +2196,130 @@ class OSSim:
         count_text = self.font.render(f"Active Processes: {proc_count}", True, Config.BLACK)
         screen.blit(count_text, (x + 10, stats_y + 45))
         
-        # Draw vertical legend on the right side
-        legend_x = x + width - 120  # Position legend on the right
-        legend_y = y + 40  # Start legend below the title
-        legend_items = [
-            ("Free", Config.RED),
+        # Create a smaller font for legends
+        small_font = pygame.font.SysFont(None, 16)
+        
+        # Draw legends on the right side
+        legend_x = x + width - 120
+        legend_y = y + 40
+        
+        # Draw algorithm patterns legend
+        algo_legend = [
+            ("First-Fit", "Diagonal lines"),
+            ("Best-Fit", "Checkered"),
+            ("Worst-Fit", "Gradient")
+        ]
+        
+        # Draw process state colors legend
+        process_legend = [
             ("Running", Config.GREEN),
             ("Ready", (0, 200, 0)),
-            ("Blocked", (128, 0, 128)),  # Violet
+            ("Blocked", (128, 0, 128)),
             ("IO", (0, 100, 0))
         ]
         
         # Draw vertical separator line
-        pygame.draw.line(screen, Config.GRAY, (legend_x - 10, legend_y), (legend_x - 10, legend_y + len(legend_items) * 25))
+        pygame.draw.line(screen, Config.GRAY, (legend_x - 10, legend_y), 
+                        (legend_x - 10, legend_y + (len(algo_legend) + len(process_legend)) * 20))
         
-        for i, (text, color) in enumerate(legend_items):
-            item_y = legend_y + i * 25
+        # Draw algorithm patterns
+        for i, (algo, pattern) in enumerate(algo_legend):
+            item_y = legend_y + i * 20
+            # Draw pattern example
+            if algo == "First-Fit":
+                pygame.draw.rect(screen, Config.RED, (legend_x, item_y, 15, 15))
+                pygame.draw.line(screen, (200, 0, 0), (legend_x, item_y), 
+                               (legend_x + 15, item_y + 15))
+            elif algo == "Best-Fit":
+                pygame.draw.rect(screen, Config.RED, (legend_x, item_y, 15, 15))
+                pygame.draw.rect(screen, (200, 0, 0), (legend_x, item_y, 7, 7))
+                pygame.draw.rect(screen, (200, 0, 0), (legend_x + 8, item_y + 8, 7, 7))
+            else:  # Worst-Fit
+                pygame.draw.rect(screen, Config.RED, (legend_x, item_y, 15, 15))
+                for j in range(0, 15, 2):
+                    color = (200 - int(j * 100 / 15), 0, 0)
+                    pygame.draw.line(screen, color, 
+                                   (legend_x, item_y + j), 
+                                   (legend_x + 15, item_y + j))
+            
+            # Draw text with smaller font
+            text = f"{algo}: {pattern}"
+            text_surf = small_font.render(text, True, Config.BLACK)
+            screen.blit(text_surf, (legend_x + 20, item_y))
+        
+        # Draw process state colors
+        for i, (state, color) in enumerate(process_legend):
+            item_y = legend_y + (len(algo_legend) + i) * 20
+            # Draw color box
             pygame.draw.rect(screen, color, (legend_x, item_y, 15, 15))
             pygame.draw.rect(screen, Config.BLACK, (legend_x, item_y, 15, 15), 1)
-            text_surf = self.font.render(text, True, Config.BLACK)
+            
+            # Draw text with smaller font
+            text_surf = small_font.render(state, True, Config.BLACK)
             screen.blit(text_surf, (legend_x + 20, item_y))
-    
+
     def draw_storage(self, screen, x, y, width, height):
         """Draw the storage visualization with enhanced information."""
         # Draw main storage container
         pygame.draw.rect(screen, Config.GRAY, (x, y, width, height), 2)
         
-        # Draw title and algorithm info
+        # Draw title and algorithm info with explanation
         title_text = self.font.render(f"Storage ({self.filesystem.storage.algorithm})", True, Config.BLACK)
         screen.blit(title_text, (x + 10, y + 10))
         
+        # Add algorithm explanation
+        algo_explanation = {
+            "First-Fit": "Finds first block that fits",
+            "Best-Fit": "Finds smallest block that fits",
+            "Worst-Fit": "Finds largest block available"
+        }[self.filesystem.storage.algorithm]
+        
+        explanation_text = self.font.render(algo_explanation, True, Config.BLUE)
+        screen.blit(explanation_text, (x + width - 200, y + 10))
+        
         # Draw storage blocks
-        storage_height = height - 120  # Increased space for information
+        storage_height = height - 120
         scale_factor = storage_height / self.filesystem.storage.total_size
         
         # Draw storage scale
         scale_y = y + 40
         pygame.draw.line(screen, Config.BLACK, (x + 10, scale_y), (x + 110, scale_y))
-        for i in range(0, self.filesystem.storage.total_size + 1, 256):  # Show scale every 256KB
+        for i in range(0, self.filesystem.storage.total_size + 1, 256):
             scale_pos = scale_y + int(i * scale_factor)
             pygame.draw.line(screen, Config.BLACK, (x + 8, scale_pos), (x + 12, scale_pos))
-            if i % 512 == 0:  # Show labels every 512KB
+            if i % 512 == 0:
                 scale_text = self.font.render(f"{i}KB", True, Config.BLACK)
                 screen.blit(scale_text, (x + 120, scale_pos - 10))
         
-        # Draw free blocks (red with pattern)
+        # Draw free blocks with different patterns based on algorithm
         for start, size in self.filesystem.storage.blocks:
             block_y = scale_y + int(start * scale_factor)
             block_height = max(1, int(size * scale_factor))
-            # Draw block with pattern
-            pygame.draw.rect(screen, Config.RED, (x + 10, block_y, 100, block_height))
-            # Draw diagonal lines for pattern
-            for i in range(0, block_height, 5):
-                pygame.draw.line(screen, (200, 0, 0), 
-                               (x + 10, block_y + i), 
-                               (x + 10 + min(100, i), block_y + i))
+            
+            # Different patterns for different algorithms
+            if self.filesystem.storage.algorithm == "First-Fit":
+                # First Fit: Solid color with diagonal lines
+                pygame.draw.rect(screen, Config.RED, (x + 10, block_y, 100, block_height))
+                for i in range(0, block_height, 5):
+                    pygame.draw.line(screen, (200, 0, 0), 
+                                   (x + 10, block_y + i), 
+                                   (x + 10 + min(100, i), block_y + i))
+            elif self.filesystem.storage.algorithm == "Best-Fit":
+                # Best Fit: Checkered pattern
+                pygame.draw.rect(screen, Config.RED, (x + 10, block_y, 100, block_height))
+                for i in range(0, block_height, 10):
+                    for j in range(0, 100, 10):
+                        if (i + j) % 20 == 0:
+                            pygame.draw.rect(screen, (200, 0, 0), 
+                                          (x + 10 + j, block_y + i, 10, 10))
+            else:  # Worst-Fit
+                # Worst Fit: Gradient pattern
+                pygame.draw.rect(screen, Config.RED, (x + 10, block_y, 100, block_height))
+                for i in range(0, block_height, 2):
+                    color = (200 - int(i * 100 / block_height), 0, 0)
+                    pygame.draw.line(screen, color, 
+                                   (x + 10, block_y + i), 
+                                   (x + 110, block_y + i))
         
         # Draw allocated blocks (with file info)
         for fname, (start, size) in self.filesystem.storage.allocated.items():
@@ -2007,24 +2381,65 @@ class OSSim:
             stat_text = self.font.render(stat, True, Config.BLACK)
             screen.blit(stat_text, (x + 10, stats_y + 5 + i * 20))
         
-        # Draw file type legend on the right side
-        legend_x = x + width - 120  # Position legend on the right
-        legend_y = y + 40  # Start legend below the title
-        legend_items = [
-            ("Text", (0, 200, 0)),
-            ("Image", (0, 150, 255)),
-            ("Audio", (255, 150, 0)),
-            ("Other", Config.GREEN)
+        # Create a smaller font for legends
+        small_font = pygame.font.SysFont(None, 16)
+        
+        # Draw legends on the right side
+        legend_x = x + width - 120
+        legend_y = y + 40
+        
+        # Draw algorithm patterns legend
+        algo_legend = [
+            ("First-Fit", "Diagonal lines"),
+            ("Best-Fit", "Checkered"),
+            ("Worst-Fit", "Gradient")
+        ]
+        
+        # Draw file type colors legend
+        file_legend = [
+            ("Text files", (0, 200, 0)),
+            ("Images", (0, 150, 255)),
+            ("Audio", (255, 150, 0))
         ]
         
         # Draw vertical separator line
-        pygame.draw.line(screen, Config.GRAY, (legend_x - 10, legend_y), (legend_x - 10, legend_y + len(legend_items) * 25))
+        pygame.draw.line(screen, Config.GRAY, (legend_x - 10, legend_y), 
+                        (legend_x - 10, legend_y + (len(algo_legend) + len(file_legend)) * 20))
         
-        for i, (text, color) in enumerate(legend_items):
-            item_y = legend_y + i * 25
+        # Draw algorithm patterns
+        for i, (algo, pattern) in enumerate(algo_legend):
+            item_y = legend_y + i * 20
+            # Draw pattern example
+            if algo == "First-Fit":
+                pygame.draw.rect(screen, Config.RED, (legend_x, item_y, 15, 15))
+                pygame.draw.line(screen, (200, 0, 0), (legend_x, item_y), 
+                               (legend_x + 15, item_y + 15))
+            elif algo == "Best-Fit":
+                pygame.draw.rect(screen, Config.RED, (legend_x, item_y, 15, 15))
+                pygame.draw.rect(screen, (200, 0, 0), (legend_x, item_y, 7, 7))
+                pygame.draw.rect(screen, (200, 0, 0), (legend_x + 8, item_y + 8, 7, 7))
+            else:  # Worst-Fit
+                pygame.draw.rect(screen, Config.RED, (legend_x, item_y, 15, 15))
+                for j in range(0, 15, 2):
+                    color = (200 - int(j * 100 / 15), 0, 0)
+                    pygame.draw.line(screen, color, 
+                                   (legend_x, item_y + j), 
+                                   (legend_x + 15, item_y + j))
+            
+            # Draw text with smaller font
+            text = f"{algo}: {pattern}"
+            text_surf = small_font.render(text, True, Config.BLACK)
+            screen.blit(text_surf, (legend_x + 20, item_y))
+        
+        # Draw file type colors
+        for i, (file_type, color) in enumerate(file_legend):
+            item_y = legend_y + (len(algo_legend) + i) * 20
+            # Draw color box
             pygame.draw.rect(screen, color, (legend_x, item_y, 15, 15))
             pygame.draw.rect(screen, Config.BLACK, (legend_x, item_y, 15, 15), 1)
-            text_surf = self.font.render(text, True, Config.BLACK)
+            
+            # Draw text with smaller font
+            text_surf = small_font.render(file_type, True, Config.BLACK)
             screen.blit(text_surf, (legend_x + 20, item_y))
     
     def draw_files(self, screen, x, y, width, height):
@@ -2687,6 +3102,270 @@ class OSSim:
                 self.editor_scroll = current_line
             elif current_line >= self.editor_scroll + visible_lines:
                 self.editor_scroll = current_line - visible_lines + 1
+
+    def show_deadlock_visualization(self):
+        """Show the deadlock visualization window."""
+        if not self.deadlock_visualizer:
+            # Store current window size
+            current_size = self.screen.get_size()
+            
+            # Create and run the visualization
+            self.deadlock_visualizer = DeadlockVisualizer(self.font, self.resource_manager)
+            self.deadlock_visualizer.initialize()
+            self.deadlock_visualizer.run()
+            self.deadlock_visualizer = None
+            
+            # Restore main window size
+            self.screen = pygame.display.set_mode(current_size)
+            pygame.display.set_caption("OSSim")
+
+class DeadlockVisualizer:
+    def __init__(self, font, resource_manager):
+        self.font = font
+        self.resource_manager = resource_manager
+        self.screen = None
+        self.clock = None
+        self.running = False
+        self.close_button = None
+        self.width = 800  # Add width attribute
+        self.height = 600  # Add height attribute
+
+    def initialize(self):
+        """Initialize the visualization window."""
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        pygame.display.set_caption("Deadlock Visualization")
+        self.clock = pygame.time.Clock()
+        self.close_button = Button(self.width - 100, 10, 80, 30, "Close", Config.RED, self.close)
+        
+        # Create close button
+        self.close_button = Button(700, 550, 80, 30, "Close", Config.RED, self.close)
+
+    def close(self):
+        """Close the visualization window."""
+        self.running = False
+
+    def draw_resource_graph(self):
+        # Clear the screen
+        self.screen.fill(Config.WHITE)
+        
+        # Get deadlock information
+        deadlock_detected, deadlock_info = self.resource_manager.detect_deadlock()
+        
+        # Draw title
+        title = self.font.render("Resource Allocation Graph", True, Config.BLACK)
+        self.screen.blit(title, (self.width // 2 - title.get_width() // 2, 20))
+        
+        # Draw explanation
+        if deadlock_detected:
+            explanation = [
+                "Deadlock Cause:",
+                "A circular wait condition exists where:"
+            ]
+            
+            # Add process-specific information
+            for cycle in deadlock_info:
+                for pid, resource in cycle:
+                    # Get what the process is holding
+                    holding = []
+                    for held_pid, resources in self.resource_manager.allocated.items():
+                        if held_pid == pid:
+                            holding.extend(resources)
+                    
+                    # Get what the process is waiting for
+                    waiting_for = []
+                    for req_pid, resources in self.resource_manager.requests.items():
+                        if req_pid == pid:
+                            waiting_for.extend(resources)
+                    
+                    # Draw process information
+                    text = f"Process {pid}: Holding {holding if holding else 'nothing'}, Waiting for {waiting_for if waiting_for else 'nothing'}"
+                    explanation.append(text)
+            
+            # Draw explanation text
+            y_offset = 60
+            for line in explanation:
+                text = self.font.render(line, True, Config.BLACK)
+                self.screen.blit(text, (20, y_offset))
+                y_offset += 30
+        
+        # Calculate graph dimensions and center position
+        graph_width = 600
+        graph_height = 400
+        graph_x = (self.width - graph_width) // 2
+        graph_y = 200  # Start below the explanation
+        
+        # Draw processes and resources
+        process_positions = {}
+        resource_positions = {}
+        
+        # Get all processes and resources
+        processes = set()
+        resources = set()
+        
+        for pid, info in self.resource_manager.allocated.items():
+            processes.add(pid)
+            for resource in info:
+                resources.add(resource)
+        
+        for pid, info in self.resource_manager.requests.items():
+            processes.add(pid)
+            for resource in info:
+                resources.add(resource)
+        
+        # Calculate positions in a circular layout with more spacing
+        num_processes = len(processes)
+        num_resources = len(resources)
+        radius = min(graph_width, graph_height) // 3
+        
+        # Position processes in a circle
+        for i, pid in enumerate(processes):
+            angle = 2 * math.pi * i / num_processes
+            x = graph_x + graph_width // 2 + radius * math.cos(angle)
+            y = graph_y + graph_height // 2 + radius * math.sin(angle)
+            process_positions[pid] = (x, y)
+            
+            # Draw process
+            pygame.draw.circle(self.screen, Config.BLUE, (int(x), int(y)), 20)
+            text = self.font.render(f"P{pid}", True, Config.WHITE)
+            self.screen.blit(text, (int(x) - text.get_width() // 2, int(y) - text.get_height() // 2))
+        
+        # Position resources in an inner circle with more spacing
+        for i, resource in enumerate(resources):
+            angle = 2 * math.pi * i / num_resources
+            x = graph_x + graph_width // 2 + (radius * 0.7) * math.cos(angle)
+            y = graph_y + graph_height // 2 + (radius * 0.7) * math.sin(angle)
+            resource_positions[resource] = (x, y)
+            
+            # Draw resource
+            pygame.draw.rect(self.screen, Config.GREEN, (int(x) - 25, int(y) - 15, 50, 30))
+            text = self.font.render(resource, True, Config.WHITE)
+            self.screen.blit(text, (int(x) - text.get_width() // 2, int(y) - text.get_height() // 2))
+        
+        # Draw allocation edges with curves
+        for pid, resources in self.resource_manager.allocated.items():
+            if pid in process_positions:
+                for resource in resources:
+                    if resource in resource_positions:
+                        start = process_positions[pid]
+                        end = resource_positions[resource]
+                        
+                        # Calculate control points for the curve
+                        mid_x = (start[0] + end[0]) / 2
+                        mid_y = (start[1] + end[1]) / 2
+                        control_x = mid_x + (end[1] - start[1]) * 0.2
+                        control_y = mid_y - (end[0] - start[0]) * 0.2
+                        
+                        # Draw curved line
+                        points = []
+                        for t in range(0, 101, 5):
+                            t = t / 100
+                            x = (1-t)**2 * start[0] + 2*(1-t)*t * control_x + t**2 * end[0]
+                            y = (1-t)**2 * start[1] + 2*(1-t)*t * control_y + t**2 * end[1]
+                            points.append((int(x), int(y)))
+                        
+                        for i in range(len(points)-1):
+                            pygame.draw.line(self.screen, Config.BLACK, points[i], points[i+1], 2)
+                        
+                        # Draw arrow
+                        arrow_size = 10
+                        angle = math.atan2(end[1] - points[-2][1], end[0] - points[-2][0])
+                        arrow_points = [
+                            (end[0] - arrow_size * math.cos(angle - math.pi/6),
+                             end[1] - arrow_size * math.sin(angle - math.pi/6)),
+                            end,
+                            (end[0] - arrow_size * math.cos(angle + math.pi/6),
+                             end[1] - arrow_size * math.sin(angle + math.pi/6))
+                        ]
+                        pygame.draw.polygon(self.screen, Config.BLACK, arrow_points)
+        
+        # Draw request edges with curves
+        for pid, resources in self.resource_manager.requests.items():
+            if pid in process_positions:
+                for resource in resources:
+                    if resource in resource_positions:
+                        start = process_positions[pid]
+                        end = resource_positions[resource]
+                        
+                        # Calculate control points for the curve
+                        mid_x = (start[0] + end[0]) / 2
+                        mid_y = (start[1] + end[1]) / 2
+                        control_x = mid_x - (end[1] - start[1]) * 0.2
+                        control_y = mid_y + (end[0] - start[0]) * 0.2
+                        
+                        # Draw curved dashed line
+                        points = []
+                        for t in range(0, 101, 5):
+                            t = t / 100
+                            x = (1-t)**2 * start[0] + 2*(1-t)*t * control_x + t**2 * end[0]
+                            y = (1-t)**2 * start[1] + 2*(1-t)*t * control_y + t**2 * end[1]
+                            points.append((int(x), int(y)))
+                        
+                        dash_length = 10
+                        gap_length = 5
+                        for i in range(0, len(points)-1, 2):
+                            if i + 1 < len(points):
+                                pygame.draw.line(self.screen, Config.RED, points[i], points[i+1], 2)
+                        
+                        # Draw arrow
+                        arrow_size = 10
+                        angle = math.atan2(end[1] - points[-2][1], end[0] - points[-2][0])
+                        arrow_points = [
+                            (end[0] - arrow_size * math.cos(angle - math.pi/6),
+                             end[1] - arrow_size * math.sin(angle - math.pi/6)),
+                            end,
+                            (end[0] - arrow_size * math.cos(angle + math.pi/6),
+                             end[1] - arrow_size * math.sin(angle + math.pi/6))
+                        ]
+                        pygame.draw.polygon(self.screen, Config.RED, arrow_points)
+        
+        # Draw legend
+        legend_y = graph_y + graph_height + 20
+        legend_items = [
+            ("Process", Config.BLUE, "circle"),
+            ("Resource", Config.GREEN, "rectangle"),
+            ("Allocation", Config.BLACK, "line"),
+            ("Request", Config.RED, "dashed")
+        ]
+        
+        for i, (text, color, shape) in enumerate(legend_items):
+            x = 20 + i * 200
+            if shape == "circle":
+                pygame.draw.circle(self.screen, color, (x + 10, legend_y + 10), 10)
+            elif shape == "rectangle":
+                pygame.draw.rect(self.screen, color, (x, legend_y, 20, 20))
+            elif shape == "line":
+                pygame.draw.line(self.screen, color, (x, legend_y + 10), (x + 20, legend_y + 10), 2)
+            elif shape == "dashed":
+                for j in range(0, 20, 5):
+                    pygame.draw.line(self.screen, color, (x + j, legend_y + 10), (x + j + 3, legend_y + 10), 2)
+            
+            text_surface = self.font.render(text, True, Config.BLACK)
+            self.screen.blit(text_surface, (x + 30, legend_y))
+        
+        # Draw close button
+        self.close_button.draw(self.screen, self.font, pygame.mouse.get_pos())
+        
+        pygame.display.flip()
+
+    def handle_events(self):
+        """Handle visualization window events."""
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.close()
+                return
+            
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if self.close_button.handle_event(event):
+                    self.close()
+                    return
+
+    def run(self):
+        """Run the visualization main loop."""
+        self.running = True
+        while self.running:
+            self.handle_events()
+            self.draw_resource_graph()
+            self.clock.tick(60)
 
 # Run the simulator
 if __name__ == "__main__":
